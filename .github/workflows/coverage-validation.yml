@@ -1,0 +1,193 @@
+name: Validate atomic coverage
+
+on:
+  push:
+    branches:
+      - validate-atomic-coverage-20261008
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: ${{ matrix.revision.name }} / ${{ matrix.mode }} / ${{ matrix.repeat }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        revision:
+          - name: base
+            sha: 109f2a55a09733a9e2b097ec737ea08fd9a054c4
+          - name: wrap
+            sha: 533085dda2fdfbbeb13a20522d261243367a34d0
+        mode: [normal, atomic]
+        repeat: [1, 2]
+    env:
+      SOURCE_SHA: ${{ matrix.revision.sha }}
+      PROFILE_MODE: ${{ matrix.mode }}
+      REPETITION: ${{ matrix.repeat }}
+    steps:
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.3'
+      - name: Check out public source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.revision.sha }}
+          persist-credentials: false
+      - name: Record toolchain and instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git rev-parse HEAD > evidence/source-revision.txt
+          xcodebuild -version > evidence/toolchain.txt
+          xcrun swiftc --version >> evidence/toolchain.txt
+          xcrun llvm-cov --version >> evidence/toolchain.txt
+          uname -m >> evidence/toolchain.txt
+          cat > "$RUNNER_TEMP/CoverageProbe.swift" <<'SWIFT'
+          @inline(never)
+          public func coverageProbe(_ flag: Bool) -> Int {
+              if flag {
+                  return 1
+              }
+              return 2
+          }
+          SWIFT
+          swift_args=(-parse-as-library -Onone -profile-generate -profile-coverage-mapping)
+          if [[ "$PROFILE_MODE" = atomic ]]; then
+            swift_args+=(-Xllvm -instrprof-atomic-counter-update-all)
+          fi
+          xcrun swiftc "${swift_args[@]}" -emit-ir -module-name CoverageProbe \
+            "$RUNNER_TEMP/CoverageProbe.swift" -o evidence/instrumentation.ll
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          ir = Path('evidence/instrumentation.ll').read_text()
+          assert '__profc_' in ir, 'Probe lacks profile counters'
+          counters = [line for line in ir.splitlines() if '__profc_' in line]
+          atomic = any('atomicrmw add' in line for line in counters)
+          stores = any(line.lstrip().startswith('store ') for line in counters)
+          expected_atomic = os.environ['PROFILE_MODE'] == 'atomic'
+          assert atomic == expected_atomic, 'Unexpected counter instrumentation'
+          assert stores != expected_atomic, 'Unexpected ordinary counter stores'
+          PY
+      - name: Build and test with coverage
+        id: tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'test user'
+          git config user.email 'test.user@noreply.com'
+          build_args=(-project SwiftFormat.xcodeproj -scheme 'SwiftFormat (Framework)')
+          build_args+=(-sdk macosx clean build test -enableCodeCoverage YES -derivedDataPath Build/)
+          if [[ "$PROFILE_MODE" = atomic ]]; then
+            build_args+=('OTHER_SWIFT_FLAGS=$(inherited) -Xllvm -instrprof-atomic-counter-update-all')
+          fi
+          set +e
+          xcodebuild "${build_args[@]}" 2>&1 | tee evidence/xcodebuild.log
+          test_exit_code=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$test_exit_code" > evidence/test-exit-code.txt
+          exit "$test_exit_code"
+      - name: Preserve and export coverage
+        if: ${{ always() && steps.tests.outcome != 'skipped' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil, subprocess, tarfile
+          results = sorted(Path('Build/Logs/Test').glob('*.xcresult'))
+          with tarfile.open('evidence/test-results.tar.gz', 'w:gz') as archive:
+              for result in results:
+                  archive.add(result, arcname=result.name)
+          profiles = sorted(Path('Build/Build/ProfileData').glob('*/Coverage.profdata'))
+          Path('evidence/profile-paths.txt').write_text('\n'.join(map(str, profiles)) + '\n')
+          if Path('Build/Build/ProfileData').exists():
+              shutil.copytree('Build/Build/ProfileData', 'evidence/ProfileData')
+          with tarfile.open('evidence/coverage-binaries.tar.gz', 'w:gz') as archive:
+              for name in ['SwiftFormat.framework', 'SwiftFormatTests.xctest']:
+                  product = Path('Build/Build/Products/Debug') / name
+                  if product.exists():
+                      archive.add(product, arcname=name)
+          for index, result in enumerate(results):
+              with Path(f'evidence/test-summary-{index}.json').open('w') as output:
+                  subprocess.run(['xcrun', 'xcresulttool', 'get', 'test-results', 'summary',
+                                  '--path', str(result)], stdout=output, check=True)
+          assert len(results) == 1, f'Expected one test result, found {len(results)}'
+          assert len(profiles) == 1, f'Expected one merged profile, found {len(profiles)}'
+          shutil.copy2(profiles[0], 'evidence/Coverage.profdata')
+          PY
+          xcrun llvm-cov export -format=lcov -instr-profile evidence/Coverage.profdata \
+            Build/Build/Products/Debug/SwiftFormat.framework/SwiftFormat \
+            > evidence/info.lcov 2> evidence/export-stderr.txt
+      - name: Check raw coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, os, re
+          coverage = {}
+          invalid = []
+          path = None
+          for row in Path('evidence/info.lcov').read_text().splitlines():
+              if row.startswith('SF:'):
+                  path = str(Path(row[3:]).relative_to(Path.cwd()))
+              elif row.startswith('DA:'):
+                  line, count = map(int, row[3:].split(',')[:2])
+                  key = (path, line)
+                  assert key not in coverage, f'Duplicate line: {key}'
+                  coverage[key] = count
+                  if count < 0 or count >= 2**63:
+                      invalid.append({'file': path, 'line': line, 'count': str(count)})
+          log = Path('evidence/xcodebuild.log').read_text()
+          passed = re.findall(r'(?m)^Test [Cc]ase .+ passed.*$', log)
+          assert len(passed) > 6000, f'Unexpected test count: {len(passed)}'
+          assert any('VersionTests' in row and 'testPreviewComparison' in row for row in passed)
+          assert any('VersionTests' in row and 'testWildcardVersion' in row for row in passed)
+          tests = json.loads(Path('evidence/test-summary-0.json').read_text())
+          assert tests['failedTests'] == 0, 'Test failures reported'
+          assert tests['passedTests'] > 6000, 'Unexpected test result count'
+          mode = os.environ['PROFILE_MODE']
+          atomic_flag = '-instrprof-atomic-counter-update-all'
+          compiler_lines = [row for row in log.splitlines()
+                            if ('swift-frontend' in row or '/swiftc ' in row)
+                            and re.search(r'-module-name\s+SwiftFormat(?:\s|$)', row)]
+          assert compiler_lines, 'No framework compiler commands recorded'
+          assert all((atomic_flag in row) == (mode == 'atomic') for row in compiler_lines), \
+              'Unexpected framework compiler options'
+          tracked = {
+              'Sources/SwiftFormat.swift': [830, 831, 832, 836, 837, 838, 839, 840, 841, 842, 843],
+              'Sources/Formatter.swift': [428],
+              'Sources/Options.swift': [277, 278, 279, 280, 281, 379],
+          }
+          observed = {file: {str(line): str(coverage[(file, line)]) for line in lines}
+                      for file, lines in tracked.items()}
+          summary = {
+              'source': os.environ['SOURCE_SHA'], 'mode': mode,
+              'repeat': int(os.environ['REPETITION']), 'passed_test_count': tests['passedTests'],
+              'total_test_count': tests['totalTestCount'], 'skipped_test_count': tests['skippedTests'],
+              'lines': len(coverage), 'hits': sum(count > 0 for count in coverage.values()),
+              'invalid_counts': invalid, 'tracked_counts': observed,
+          }
+          Path('evidence/summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          if mode == 'atomic':
+              assert not invalid, 'Atomic run still has invalid counters'
+              assert all(coverage[('Sources/Options.swift', line)] >= 4 for line in range(277, 282)), \
+                  'Direct version-comparison tests did not register their executions'
+          PY
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.revision.name }}-${{ matrix.mode }}-${{ matrix.repeat }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 5
