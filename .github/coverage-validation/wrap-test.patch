@@ -1,0 +1,19 @@
+diff --git a/Tests/Rules/WrapTests.swift b/Tests/Rules/WrapTests.swift
+index 3130ccfd..f7292cb7 100644
+--- a/Tests/Rules/WrapTests.swift
++++ b/Tests/Rules/WrapTests.swift
+@@ -52,6 +52,14 @@ final class WrapTests: XCTestCase {
+         XCTAssertEqual(formatter.indexWhereLineShouldWrap(from: 0), 4)
+     }
+ 
++    func testWrapBeforeClosingBraceWhenItExceedsMaximumWidth() {
++        let input = """
++        let foo = bar { baz }
++        """
++        let formatter = Formatter(tokenize(input), options: FormatOptions(maxWidth: 20))
++        XCTAssertEqual(formatter.indexWhereLineShouldWrap(from: 0), 10)
++    }
++
+     func testNoWrapShortNestedClosureArguments() {
+         let input = """
+         let transform = { (value: Widget, body: (Widget) -> Widget) in body(value) }

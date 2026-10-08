@@ -1,12 +1,16 @@
-name: Validate atomic coverage
+name: Validate coverage repair
 
 on:
   push:
     branches:
-      - validate-atomic-coverage-20261008
+      - validate-coverage-repair-20261008
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    working-directory: source
 
 jobs:
   coverage:
@@ -20,12 +24,19 @@ jobs:
         revision:
           - name: base
             sha: 109f2a55a09733a9e2b097ec737ea08fd9a054c4
+          - name: indent
+            sha: 2d64de0be70ecce326bb14f8be819cbfde0095a3
           - name: wrap
             sha: 533085dda2fdfbbeb13a20522d261243367a34d0
-        mode: [normal, atomic]
+          - name: cache
+            sha: 63a42eaa9f3f3ce1cdde44da89cc6b87551ec719
+          - name: refs
+            sha: 5c632b6e69027e27ce9a64e37e7cd26f978e8a32
+        mode: [atomic]
         repeat: [1, 2]
     env:
       SOURCE_SHA: ${{ matrix.revision.sha }}
+      SOURCE_NAME: ${{ matrix.revision.name }}
       PROFILE_MODE: ${{ matrix.mode }}
       REPETITION: ${{ matrix.repeat }}
     steps:
@@ -33,18 +44,42 @@ jobs:
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '16.3'
+      - name: Check out validation patches
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: validation
+          persist-credentials: false
       - name: Check out public source
         uses: actions/checkout@v5
         with:
           ref: ${{ matrix.revision.sha }}
+          path: source
           persist-credentials: false
-      - name: Record toolchain and instrumentation
+      - name: Apply and record validation patches
         shell: bash
         run: |
           set -euo pipefail
           mkdir evidence
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           git rev-parse HEAD > evidence/source-revision.txt
+          git -C ../validation rev-parse HEAD > evidence/validation-revision.txt
+          patches=(../validation/.github/coverage-validation/repair.patch)
+          if [[ "$SOURCE_NAME" = wrap ]]; then
+            patches+=(../validation/.github/coverage-validation/wrap-test.patch)
+          fi
+          shasum -a 256 "${patches[@]}" > evidence/patch-sha256.txt
+          for patch in "${patches[@]}"; do
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+          git diff --check
+          git diff > evidence/applied.patch
+      - name: Record toolchain and instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           xcodebuild -version > evidence/toolchain.txt
           xcrun swiftc --version >> evidence/toolchain.txt
           xcrun llvm-cov --version >> evidence/toolchain.txt
@@ -95,6 +130,7 @@ jobs:
           printf '%s\n' "$test_exit_code" > evidence/test-exit-code.txt
           exit "$test_exit_code"
       - name: Preserve and export coverage
+        id: coverage
         if: ${{ always() && steps.tests.outcome != 'skipped' }}
         shell: bash
         run: |
@@ -127,6 +163,7 @@ jobs:
             Build/Build/Products/Debug/SwiftFormat.framework/SwiftFormat \
             > evidence/info.lcov 2> evidence/export-stderr.txt
       - name: Check raw coverage
+        if: ${{ always() && steps.coverage.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -151,6 +188,9 @@ jobs:
           assert len(passed) > 6000, f'Unexpected test count: {len(passed)}'
           assert any('VersionTests' in row and 'testPreviewComparison' in row for row in passed)
           assert any('VersionTests' in row and 'testWildcardVersion' in row for row in passed)
+          if os.environ['SOURCE_NAME'] == 'wrap':
+              assert any('testWrapBeforeClosingBraceWhenItExceedsMaximumWidth' in row for row in passed), \
+                  'Added wrap regression test did not pass'
           tests = json.loads(Path('evidence/test-summary-0.json').read_text())
           assert tests['failedTests'] == 0, 'Test failures reported'
           assert tests['passedTests'] > 6000, 'Unexpected test result count'
@@ -187,7 +227,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-${{ matrix.revision.name }}-${{ matrix.mode }}-${{ matrix.repeat }}
-          path: evidence/
+          name: repair-${{ matrix.revision.name }}-atomic-${{ matrix.repeat }}
+          path: source/evidence/
           if-no-files-found: error
           retention-days: 5

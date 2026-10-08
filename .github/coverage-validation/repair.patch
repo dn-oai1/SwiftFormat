@@ -1,0 +1,90 @@
+diff --git a/Sources/Arguments.swift b/Sources/Arguments.swift
+index 4e9afecb..968d37e6 100644
+--- a/Sources/Arguments.swift
++++ b/Sources/Arguments.swift
+@@ -542,7 +542,8 @@ func parseRules(_ rules: String, ignoreUnknown: Bool) throws -> [String] {
+             return []
+         }
+         if Descriptors.all.contains(where: { $0.argumentName == lowercaseName }) {
+-            for rule in FormatRules.all where rule.options.contains(lowercaseName) {
++            for rule in FormatRules.all {
++                guard rule.options.contains(lowercaseName) else { continue }
+                 throw FormatError.options(
+                     "'\(proposedName)' is not a formatting rule. Did you mean '\(rule.name)'?"
+                 )
+diff --git a/Sources/Rules/RedundantFileprivate.swift b/Sources/Rules/RedundantFileprivate.swift
+index 83a6c3e5..dfbf6866 100644
+--- a/Sources/Rules/RedundantFileprivate.swift
++++ b/Sources/Rules/RedundantFileprivate.swift
+@@ -183,9 +183,10 @@ extension Formatter {
+                     i = endIndex
+                     break
+                 }
+-                for case let .identifier(name) in tokens[startIndex ..< endIndex]
+-                    where names.contains(name)
+-                {
++                for token in tokens[startIndex ..< endIndex] {
++                    guard case let .identifier(name) = token,
++                          names.contains(name)
++                    else { continue }
+                     return true
+                 }
+                 i = endIndex
+diff --git a/Sources/Tokenizer.swift b/Sources/Tokenizer.swift
+index 2f777812..5c40b6f8 100644
+--- a/Sources/Tokenizer.swift
++++ b/Sources/Tokenizer.swift
+@@ -1640,10 +1640,13 @@ public func tokenize(_ source: String) -> [Token] {
+                 break
+             }
+         }
+-        while let nextToken = index + 1 < tokens.count ? tokens[index + 1] : nil,
+-              case let .operator(nextString, _) = nextToken, !nextString.hasPrefix("\\"),
+-              string.hasPrefix(".") || !nextString.contains(".")
+-        {
++        while true {
++            guard let nextToken = index + 1 < tokens.count ? tokens[index + 1] : nil,
++                  case let .operator(nextString, _) = nextToken, !nextString.hasPrefix("\\"),
++                  string.hasPrefix(".") || !nextString.contains(".")
++            else {
++                break
++            }
+             if scopeIndexStack.last == index {
+                 // In case of a ? previously interpreted as a ternary
+                 scopeIndexStack.removeLast()
+@@ -1653,10 +1656,13 @@ public func tokenize(_ source: String) -> [Token] {
+             scopeIndexStack = scopeIndexStack.map { $0 > index ? $0 - 1 : $0 }
+         }
+         var index = index
+-        while let prevToken = index > 0 ? tokens[index - 1] : nil,
+-              case let .operator(prevString, _) = prevToken, !isUnwrapOperator(at: index - 1),
+-              !string.hasPrefix("\\"), prevString.hasPrefix(".") || !string.contains(".")
+-        {
++        while true {
++            guard let prevToken = index > 0 ? tokens[index - 1] : nil,
++                  case let .operator(prevString, _) = prevToken, !isUnwrapOperator(at: index - 1),
++                  !string.hasPrefix("\\"), prevString.hasPrefix(".") || !string.contains(".")
++            else {
++                break
++            }
+             if scopeIndexStack.last == index - 1 {
+                 // In case of a ? previously interpreted as a ternary
+                 scopeIndexStack.removeLast()
+@@ -1707,7 +1713,7 @@ public func tokenize(_ source: String) -> [Token] {
+         case ".":
+             var _type = OperatorType.prefix
+             var prevNonSpaceIndex = prevNonSpaceIndex
+-            repeat {
++            while true {
+                 let prevNonSpaceToken = tokens[prevNonSpaceIndex]
+                 if prevNonSpaceToken.isLvalue {
+                     var lineStart = index(of: .linebreak, before: prevNonSpaceIndex) ?? 0
+@@ -1736,7 +1742,7 @@ public func tokenize(_ source: String) -> [Token] {
+                     _type = .infix
+                 }
+                 break
+-            } while true
++            }
+             type = _type
+         case "?":
+             if prevToken.isSpaceOrCommentOrLinebreak {
